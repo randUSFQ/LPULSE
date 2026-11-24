@@ -1,0 +1,254 @@
+openapi: 3.0.3
+info:
+  title: Smart Inventory API
+  version: 1.0.0
+  description: |
+    Contrato v1 (el contrato precede a la implementacion; ver OpenApiContractTest).
+    Errores: application/problem+json con code, detail, requestId y errors[].
+    Rate limit: por cliente autenticado; cabeceras X-RateLimit-Limit/Remaining; 429 incluye Retry-After.
+    Cambios incompatibles => /api/v2 con migracion; nunca se modifica v1 en silencio.
+servers:
+  - url: http://localhost:8080
+security:
+  - ApiKey: []
+paths:
+  /api/v1/inventory:
+    get:
+      operationId: listInventory
+      summary: Stock por SKU, ubicacion y lote (US-01)
+      description: Distingue fisico, reservado y disponible. Sin resultados => 200 con items vacio.
+      x-required-scope: inventory:read
+      parameters:
+        - { name: sku, in: query, schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' } }
+        - { name: location, in: query, schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' } }
+        - { name: lot, in: query, schema: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' } }
+        - { name: page, in: query, schema: { type: integer, minimum: 0, default: 0 } }
+        - { name: size, in: query, schema: { type: integer, minimum: 1, maximum: 100, default: 20 } }
+        - { name: sort, in: query, schema: { type: string, enum: [sku, location, lotCode, expiresOn, available], default: expiresOn } }
+        - { name: order, in: query, schema: { type: string, enum: [asc, desc], default: asc } }
+      responses:
+        '200':
+          description: Pagina de stock (puede estar vacia)
+          headers:
+            X-RateLimit-Limit: { schema: { type: integer } }
+            X-RateLimit-Remaining: { schema: { type: integer } }
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/StockPage' }
+              example:
+                items: [{ sku: SKU-1001, location: BOD-UIO, lotCode: L-B, expiresOn: '2026-12-01', physical: 30, reserved: 0, available: 30 }]
+                page: 0
+                size: 20
+                totalItems: 1
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/reservations:
+    post:
+      operationId: createReservation
+      summary: Reserva FEFO atomica e idempotente (US-02)
+      description: |
+        Asigna lotes por vencimiento (nunca vencidos) sin sobreasignar. Repetir la misma Idempotency-Key con el
+        mismo cuerpo devuelve la reserva original (200, Idempotent-Replay: true). La misma clave con otro cuerpo => 422.
+      x-required-scope: inventory:reserve
+      parameters:
+        - name: Idempotency-Key
+          in: header
+          required: true
+          schema: { type: string, minLength: 8, maxLength: 100 }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/ReservationRequest' }
+            example: { sku: SKU-1001, location: BOD-UIO, quantity: 50, destination: PEDIDO-7788 }
+      responses:
+        '200':
+          description: Reintento idempotente; devuelve la reserva original
+          headers: { Idempotent-Replay: { schema: { type: string, example: 'true' } } }
+          content: { application/json: { schema: { $ref: '#/components/schemas/Reservation' } } }
+        '201':
+          description: Reserva creada
+          content: { application/json: { schema: { $ref: '#/components/schemas/Reservation' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: Stock insuficiente (code INSUFFICIENT_STOCK). El cliente NO debe reintentar igual.
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '422':
+          description: Validacion de negocio/cuerpo (VALIDATION_FAILED) o clave de idempotencia reutilizada (IDEMPOTENCY_KEY_REUSED)
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+        '503': { $ref: '#/components/responses/Unavailable' }
+  /api/v1/replenishment/suggestions:
+    get:
+      operationId: listSuggestions
+      summary: Sugerencias de reposicion (US-03). No muta stock.
+      x-required-scope: replenishment:read
+      parameters:
+        - { name: status, in: query, schema: { type: string, enum: [OPEN, APPROVED] } }
+        - { name: sku, in: query, schema: { type: string } }
+        - { name: supplier, in: query, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer, minimum: 1, maximum: 200, default: 50 } }
+      responses:
+        '200':
+          description: Lista de sugerencias
+          content:
+            application/json:
+              schema: { type: array, items: { $ref: '#/components/schemas/Suggestion' } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /api/v1/replenishment/suggestions/{id}/approve:
+    post:
+      operationId: approveSuggestion
+      summary: Aprobar sugerencia (OPEN -> APPROVED)
+      x-required-scope: replenishment:approve
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        '200':
+          description: Sugerencia aprobada
+          content: { application/json: { schema: { $ref: '#/components/schemas/Suggestion' } } }
+        '400': { $ref: '#/components/responses/BadRequest' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: 'Transicion invalida (INVALID_TRANSITION): la sugerencia ya no esta OPEN'
+          content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+  /api/v1/dashboard/inventory:
+    get:
+      operationId: dashboardInventory
+      summary: Vista del dashboard con antiguedad del dato (US-04)
+      x-required-scope: inventory:read
+      responses:
+        '200':
+          description: Filas con lastUpdatedAt, processingDelayMs y stale
+          content: { application/json: { schema: { $ref: '#/components/schemas/DashboardView' } } }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '429': { $ref: '#/components/responses/TooManyRequests' }
+components:
+  securitySchemes:
+    ApiKey: { type: apiKey, in: header, name: X-Api-Key }
+  responses:
+    BadRequest:
+      description: Parametro o cabecera invalidos / cuerpo ilegible (INVALID_PARAMETER, MALFORMED_REQUEST). Corregir y reenviar.
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    Unauthorized:
+      description: Falta X-Api-Key o es invalida (UNAUTHENTICATED)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    Forbidden:
+      description: Cliente autenticado sin el scope requerido (FORBIDDEN)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    NotFound:
+      description: Recurso inexistente (NOT_FOUND)
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    TooManyRequests:
+      description: Limite de tasa excedido (RATE_LIMITED). Esperar Retry-After segundos.
+      headers: { Retry-After: { schema: { type: integer } } }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+    Unavailable:
+      description: Dependencia caida (DEPENDENCY_UNAVAILABLE). Reintentar con backoff exponencial y jitter.
+      headers: { Retry-After: { schema: { type: integer } } }
+      content: { application/problem+json: { schema: { $ref: '#/components/schemas/Problem' } } }
+  schemas:
+    Problem:
+      type: object
+      required: [type, title, status, code, detail, requestId]
+      properties:
+        type: { type: string }
+        title: { type: string }
+        status: { type: integer }
+        code: { type: string, example: INSUFFICIENT_STOCK }
+        detail: { type: string }
+        requestId: { type: string }
+        errors:
+          type: array
+          items: { type: object, properties: { field: { type: string }, message: { type: string } } }
+    StockItem:
+      type: object
+      required: [sku, location, lotCode, expiresOn, physical, reserved, available]
+      properties:
+        sku: { type: string }
+        location: { type: string }
+        lotCode: { type: string }
+        expiresOn: { type: string, format: date }
+        physical: { type: integer }
+        reserved: { type: integer }
+        available: { type: integer, description: physical - reserved }
+    StockPage:
+      type: object
+      required: [items, page, size, totalItems]
+      properties:
+        items: { type: array, items: { $ref: '#/components/schemas/StockItem' } }
+        page: { type: integer }
+        size: { type: integer }
+        totalItems: { type: integer, format: int64 }
+    ReservationRequest:
+      type: object
+      required: [sku, location, quantity, destination]
+      properties:
+        sku: { type: string, pattern: '^[A-Za-z0-9_-]{1,64}$' }
+        location: { type: string, pattern: '^[A-Za-z0-9_-]{1,32}$' }
+        quantity: { type: integer, minimum: 1, maximum: 100000 }
+        destination: { type: string, maxLength: 64 }
+    Reservation:
+      type: object
+      required: [reservationId, sku, location, quantity, destination, status, lines, replay]
+      properties:
+        reservationId: { type: string, format: uuid }
+        sku: { type: string }
+        location: { type: string }
+        quantity: { type: integer }
+        destination: { type: string }
+        status: { type: string, enum: [CONFIRMED] }
+        replay: { type: boolean }
+        lines:
+          type: array
+          description: Resultado FEFO, en orden de consumo
+          items:
+            type: object
+            required: [lotCode, expiresOn, quantity]
+            properties:
+              lotCode: { type: string }
+              expiresOn: { type: string, format: date }
+              quantity: { type: integer }
+    Suggestion:
+      type: object
+      required: [id, sku, supplier, suggestedQty, status]
+      properties:
+        id: { type: string, format: uuid }
+        sku: { type: string }
+        supplier: { type: string }
+        suggestedQty: { type: integer }
+        status: { type: string, enum: [OPEN, APPROVED] }
+        createdAt: { type: string, format: date-time }
+        approvedBy: { type: string, nullable: true }
+        approvedAt: { type: string, format: date-time, nullable: true }
+    DashboardView:
+      type: object
+      required: [generatedAt, items]
+      properties:
+        generatedAt: { type: string, format: date-time }
+        items:
+          type: array
+          items:
+            type: object
+            properties:
+              sku: { type: string }
+              availableNow: { type: integer }
+              reservationsCount: { type: integer }
+              lastReservationId: { type: string, format: uuid }
+              lastStatus: { type: string }
+              lastEventAt: { type: string, format: date-time }
+              lastUpdatedAt: { type: string, format: date-time }
+              processingDelayMs: { type: integer, format: int64 }
+              stale: { type: boolean }

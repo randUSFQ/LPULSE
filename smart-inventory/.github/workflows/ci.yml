@@ -1,0 +1,169 @@
+name: ci
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+env:
+  IMAGE: ghcr.io/${{ github.repository }}
+
+jobs:
+  secrets-scan:                       # Gate 1: secretos expuestos (falla el PR)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with: { fetch-depth: 0 }
+      - uses: gitleaks/gitleaks-action@v2
+        env: { GITHUB_TOKEN: '${{ secrets.GITHUB_TOKEN }}' }
+
+  build-test:                         # Gate 2: build reproducible + unitarias + contrato + integracion
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21', cache: maven }
+      - name: Build, unit, contract and integration tests (Testcontainers)
+        run: mvn -B verify
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: test-reports
+          path: |
+            target/surefire-reports
+            target/failsafe-reports
+
+  sast:                               # Gate 3a: analisis estatico
+    runs-on: ubuntu-latest
+    permissions: { contents: read, security-events: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '21', cache: maven }
+      - uses: github/codeql-action/init@v3
+        with: { languages: java-kotlin, build-mode: none }
+      - uses: github/codeql-action/analyze@v3
+
+  sca:                                # Gate 3b: dependencias vulnerables (falla con HIGH/CRITICAL)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aquasecurity/trivy-action@0.28.0
+        with:
+          scan-type: fs
+          scan-ref: .
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+          # Excepciones aceptadas con justificacion: .trivyignore (CVE, motivo, responsable, fecha)
+
+  package:                            # Gate 4: imagen inmutable, SBOM y escaneo de imagen
+    needs: [secrets-scan, build-test, sast, sca]
+    runs-on: ubuntu-latest
+    permissions: { contents: read, packages: write }
+    outputs:
+      tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: meta
+        run: echo "tag=sha-${GITHUB_SHA::12}" >> "$GITHUB_OUTPUT"     # nunca :latest como identificador
+      - uses: docker/login-action@v3
+        with: { registry: ghcr.io, username: '${{ github.actor }}', password: '${{ secrets.GITHUB_TOKEN }}' }
+      - uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: ${{ github.event_name != 'pull_request' }}
+          load: ${{ github.event_name == 'pull_request' }}
+          tags: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+      - name: Image scan
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          severity: CRITICAL
+          ignore-unfixed: true
+          exit-code: '1'
+      - name: SBOM (CycloneDX)
+        uses: anchore/sbom-action@v0
+        with:
+          image: ${{ env.IMAGE }}:${{ steps.meta.outputs.tag }}
+          artifact-name: sbom-${{ steps.meta.outputs.tag }}.cdx.json
+          format: cyclonedx-json
+
+  deploy-staging:                     # Gate 5: despliegue + smoke + rollback automatico
+    if: github.ref == 'refs/heads/main'
+    needs: package
+    runs-on: ubuntu-latest
+    environment: staging              # secretos del entorno, no del repo
+    steps:
+      - uses: actions/checkout@v4
+      - name: Deploy new image
+        # La variable STAGING_LAST_GOOD_TAG (Settings > Variables) guarda el ultimo tag que paso el smoke test.
+        env: { PREV_TAG: '${{ vars.STAGING_LAST_GOOD_TAG }}' }
+        run: |
+          curl -fsS -X POST "${{ secrets.STAGING_DEPLOY_HOOK }}" \
+               --data-urlencode "imgURL=${{ env.IMAGE }}:${{ needs.package.outputs.tag }}"
+      - name: Smoke test (readiness + consulta basica)
+        id: smoke
+        run: |
+          for i in $(seq 1 30); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' "${{ secrets.STAGING_URL }}/actuator/health/readiness" || true)
+            [ "$code" = "200" ] && break
+            sleep 10
+          done
+          [ "$code" = "200" ]
+          curl -fsS -H "X-Api-Key: ${{ secrets.STAGING_OPS_KEY }}" \
+               "${{ secrets.STAGING_URL }}/api/v1/inventory?size=1" > /dev/null
+      - name: Mark release as last good
+        if: success()
+        run: gh variable set STAGING_LAST_GOOD_TAG --body "${{ needs.package.outputs.tag }}" --repo "${{ github.repository }}"
+        env: { GH_TOKEN: '${{ secrets.VARIABLES_WRITE_TOKEN }}' }   # PAT con permiso de variables (GITHUB_TOKEN no puede)
+      - name: Rollback on failure
+        if: failure() && steps.smoke.outcome == 'failure'
+        env: { PREV_TAG: '${{ vars.STAGING_LAST_GOOD_TAG }}' }
+        run: |
+          if [ -z "$PREV_TAG" ]; then echo "::error::Smoke test failed and there is no previous good tag"; exit 1; fi
+          echo "::error::Smoke test failed - rolling back to $PREV_TAG"
+          curl -fsS -X POST "${{ secrets.STAGING_DEPLOY_HOOK }}" \
+               --data-urlencode "imgURL=${{ env.IMAGE }}:${PREV_TAG}"
+          exit 1
+
+  dast-sat:                           # Gate 6: DAST (ZAP baseline) + SAT contra staging
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: SAT end-to-end (docs/sat.md automatizado)
+        run: bash scripts/sat.sh
+        env:
+          BASE_URL: ${{ secrets.STAGING_URL }}
+          OPS_KEY: ${{ secrets.STAGING_OPS_KEY }}
+          FULFILLMENT_KEY: ${{ secrets.STAGING_FULFILLMENT_KEY }}
+      - name: ZAP baseline (cuenta y datos de prueba; nunca produccion)
+        uses: zaproxy/action-baseline@v0.12.0
+        with:
+          target: ${{ secrets.STAGING_URL }}/v3/api-docs
+          # Baseline sobre la definicion OpenAPI (publica). Para escanear endpoints autenticados con la cuenta de
+          # prueba, configurar el header X-Api-Key en un ZAP context (ver README, seccion DAST).
+          cmd_options: '-a'
+          fail_action: false          # los hallazgos se triagean en docs/security-findings.md
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with: { name: dast-report, path: report_html.html }
+
+  release:                            # Gate 7: tag semver + changelog + evidencia
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: package
+    runs-on: ubuntu-latest
+    environment: production-approval  # aprobacion manual configurada en el entorno
+    permissions: { contents: write }
+    steps:
+      - uses: actions/checkout@v4
+      - uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          body: |
+            Imagen: `${{ env.IMAGE }}:${{ needs.package.outputs.tag }}`
+            Contrato: tag `api-v1.x` | Evidencia: artefactos `test-reports`, `sbom-*`, `dast-report`

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://smartinventory.usfq.edu.ec/events/inventory.stock-reserved/v1",
+  "title": "inventory.stock-reserved v1",
+  "description": "Emisor: smart-inventory (via Outbox). Exchange smartinventory.events, routing key inventory.stock-reserved. Entrega al-menos-una-vez: los consumidores deben deduplicar por eventId.",
+  "type": "object",
+  "required": ["eventId", "eventType", "schemaVersion", "occurredAt", "correlationId", "producer", "payload"],
+  "properties": {
+    "eventId": { "type": "string", "format": "uuid" },
+    "eventType": { "const": "inventory.stock-reserved" },
+    "schemaVersion": { "const": 1 },
+    "occurredAt": { "type": "string", "format": "date-time" },
+    "correlationId": { "type": "string" },
+    "producer": { "const": "smart-inventory" },
+    "payload": {
+      "type": "object",
+      "required": ["reservationId", "sku", "location", "quantity", "destination", "lines"],
+      "properties": {
+        "reservationId": { "type": "string", "format": "uuid" },
+        "sku": { "type": "string" },
+        "location": { "type": "string" },
+        "quantity": { "type": "integer", "minimum": 1 },
+        "destination": { "type": "string" },
+        "lines": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["lotCode", "quantity"],
+            "properties": { "lotCode": { "type": "string" }, "quantity": { "type": "integer", "minimum": 1 } }
+          }
+        }
+      }
+    }
+  },
+  "x-compatibility": "Agregar campos opcionales es compatible. Quitar/renombrar campos => schemaVersion 2 con doble publicacion durante la migracion."
+}

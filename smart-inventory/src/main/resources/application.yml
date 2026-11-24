@@ -1,0 +1,86 @@
+spring:
+  application:
+    name: smart-inventory
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/inventory}
+    username: ${DB_USER:inventory}
+    password: ${DB_PASSWORD:inventory}
+  flyway:
+    enabled: true
+  rabbitmq:
+    host: ${RABBIT_HOST:localhost}
+    port: ${RABBIT_PORT:5672}
+    username: ${RABBIT_USER:guest}
+    password: ${RABBIT_PASSWORD:guest}
+    publisher-confirm-type: correlated
+    listener:
+      simple:
+        concurrency: 2
+        max-concurrency: 4
+        prefetch: 10
+        default-requeue-rejected: false   # agotados los reintentos -> DLX/DLQ
+        retry:
+          enabled: true
+          initial-interval: 1s
+          multiplier: 2.0
+          max-interval: 10s
+          max-attempts: 3
+
+# Logs JSON estructurados (ECS) con requestId/correlationId del MDC
+logging:
+  structured:
+    format:
+      console: ecs
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health,info,prometheus,metrics
+  endpoint:
+    health:
+      probes:
+        enabled: true
+      show-details: never
+      group:
+        readiness:
+          include: readinessState,db,rabbit
+  metrics:
+    distribution:
+      percentiles-histogram:
+        http.server.requests: true
+  tracing:
+    sampling:
+      probability: 1.0
+  otlp:
+    tracing:
+      endpoint: ${OTLP_ENDPOINT:http://localhost:4318/v1/traces}
+
+app:
+  rate-limit:
+    strategy: ${RATE_LIMIT_STRATEGY:token-bucket}   # token-bucket | fixed-window
+    capacity: 20            # token-bucket: tamano de rafaga
+    refill-per-second: 10   # token-bucket: tasa sostenida
+    limit: 20               # fixed-window: peticiones por ventana
+    window-seconds: 1
+  outbox:
+    enabled: true
+    poll-ms: 500
+  dashboard:
+    stale-seconds: 60
+  security:
+    # SOLO DESARROLLO. En staging/produccion se inyectan por variables de entorno / gestor de secretos.
+    keys:
+      - key: ${OPS_API_KEY:dev-ops-key}
+        client: ops-console
+        scopes: [inventory:read, replenishment:read, replenishment:approve]
+      - key: ${FULFILLMENT_API_KEY:dev-fulfillment-key}
+        client: fulfillment
+        scopes: [inventory:read, inventory:reserve]
+      - key: ${PURCHASING_API_KEY:dev-purchasing-key}
+        client: purchasing
+        scopes: [replenishment:read, replenishment:approve]
+
+springdoc:
+  swagger-ui:
+    path: /swagger-ui.html

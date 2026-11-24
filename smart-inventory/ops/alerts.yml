@@ -1,0 +1,28 @@
+groups:
+  - name: smart-inventory
+    rules:
+      - alert: HighErrorRate
+        expr: sum(rate(http_server_requests_seconds_count{status=~"5.."}[5m])) / sum(rate(http_server_requests_seconds_count[5m])) > 0.05
+        for: 5m
+        labels: { severity: page }
+        annotations: { summary: "Error 5xx > 5% (runbook: docs/runbook.md)" }
+      - alert: HighP95Latency
+        expr: histogram_quantile(0.95, sum(rate(http_server_requests_seconds_bucket[5m])) by (le)) > 0.4
+        for: 5m
+        labels: { severity: warn }
+        annotations: { summary: "p95 > 400 ms" }
+      - alert: OutboxBacklog
+        expr: smartinventory_outbox_pending > 100
+        for: 2m
+        labels: { severity: page }
+        annotations: { summary: "Outbox sin publicar: broker caido o publicador detenido" }
+      - alert: DeadLetterQueueNotEmpty
+        expr: rabbitmq_detailed_queue_messages{queue="inventory.dlq"} > 0
+        for: 1m
+        labels: { severity: page }
+        annotations: { summary: "Mensajes en DLQ: inspeccionar antes de re-procesar" }
+      - alert: ConsumerQueueAging
+        expr: rabbitmq_detailed_queue_messages_ready{queue=~"dashboard.q|replenishment.q"} > 500
+        for: 5m
+        labels: { severity: warn }
+        annotations: { summary: "Cola acumulada: el consumidor no da abasto" }
